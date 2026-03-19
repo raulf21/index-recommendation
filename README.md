@@ -3,6 +3,7 @@ Learning-based index recommendation via workload-aware ranking on PostgreSQL + T
 
 ## Prerequisites
 - Python 3.8+
+- Docker
 
 ## Getting Started
 
@@ -24,26 +25,36 @@ pip install -r requirements.txt
 ```
 
 ### 4. Set up your .env file
-Create a `.env` file in the root of the project (never commit this):
+Copy the example file and fill in your own values:
+```bash
+cp .env.example .env
 ```
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=tpch
-DB_USER=postgres
-DB_PASSWORD=yourpassword
-```
-Update `DB_USER` and `DB_PASSWORD` to match your local Postgres setup.
+Update `DB_USER` and `DB_PASSWORD` to whatever you want your local credentials to be.
 
+### 5. Start the database
+Make sure Docker Desktop is running, then:
+```bash
+docker-compose up -d
+```
+
+This spins up Postgres 16 with HypoPG already installed. To stop it:
+```bash
+docker-compose down
+```
 
 ## Project Structure
 ```
 index-recommendation/
 ├── .env                  ← your local config, never committed
+├── .env.example          ← template, safe to commit
 ├── .gitignore
+├── docker-compose.yml
+├── Dockerfile
+├── init.sql              ← enables HypoPG on startup
 ├── README.md
 ├── requirements.txt
 ├── data/                 ← TPC-H .tbl files, never committed
-├── notebooks/            ← exploratory analysis
+├── notebooks/
 ├── sql/
 │   └── schema.sql
 └── src/
@@ -55,5 +66,5 @@ index-recommendation/
 ```
 
 ## Team
-- [Your Name](https://github.com/your-username)
-- [Teammate Name](https://github.com/teammate-username)
+- [Raul Flores](https://github.com/raulf21)
+- [Sindhu Satish ]()
