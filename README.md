@@ -41,6 +41,35 @@ This spins up Postgres 16 with HypoPG already installed. To stop it:
 ```bash
 docker-compose down
 ```
+### 6. Generate and load TPC-H data
+
+Clone and build the data generator:
+```bash
+git clone https://github.com/electrum/tpch-dbgen.git
+cd tpch-dbgen
+make
+./dbgen -s 1
+```
+
+Move the generated files into the data folder:
+```bash
+mv *.tbl ../data/
+cd ..
+```
+
+Load the data into the database:
+```bash
+./sql/load_data.sh
+```
+
+Verify it worked:
+```bash
+docker exec -i tpch-db psql -U postgres -d tpch -c "SELECT COUNT(*) FROM lineitem;"
+```
+
+You should see `6001215` rows.
+
+
 
 ## Project Structure
 ```
@@ -55,8 +84,10 @@ index-recommendation/
 ├── requirements.txt
 ├── data/                 ← TPC-H .tbl files, never committed
 ├── notebooks/
+├── queries/              ← TPC-H SQL query files (q1.sql - q22.sql)
 ├── sql/
 │   └── schema.sql
+│   └── load_data.sh      ← loads TPC-H data into Docker
 └── src/
     ├── workload_parser.py
     ├── candidate_generator.py
