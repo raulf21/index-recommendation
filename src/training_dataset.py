@@ -1,461 +1,392 @@
 """
 training_dataset.py
 -------------------
-Assemble ML-ready tables from `feature_extractor` output, merge labels
-produced by `hypopg_labeler`, and export train / validation / test splits.
-
-Changes from original:
-    - get_connection imported from db_utils instead of feature_extractor
-      (fixes broken import since get_connection was moved out of feature_extractor).
-    - load_labels_csv updated for Option B per-query labels: when query_name is
-      present in the labels CSV, example_id is constructed from the three columns
-      (query_name|candidate_table|candidate_cols) so merge_features_and_labels
-      joins on it exactly — one label per feature row, no broadcasting.
-      Option A (per-candidate broadcasting) still works as a legacy compatibility
-      path when query_name is absent.
-    - min_frequency replaced with min_cost_impact throughout.
-    - apply_log_transform updated to signed log1p: compresses the huge cost scale
-      so the model isn't dominated by q20's billion-scale costs. Uses signed log
-      (positive: log1p(x), negative: -log1p(|x|)) so indexes that actively hurt
-      performance are distinguishable from neutral ones. Previously clip(lower=0)
-      destroyed the anti-pattern signal by treating harmful and neutral indexes
-      identically.
-    - is_marginal conversion moved here from ml_model.py: label_source
-      ('marginal' | 'individual') is converted to a numeric is_marginal float
-      column inside merge_features_and_labels so the exported CSVs are
-      self-contained. ml_model.py's add_is_marginal() remains as a safety net
-      for older CSVs that predate this change.
+Builds the supervised ML dataset for learned index-benefit prediction.
 
 Pipeline position:
-    workload_parser → candidate_generator → feature_extractor → hypopg_labeler → training_dataset → ml_model
+    workload_parser -> candidate_generator -> feature_extractor -> hypopg_labeler
+    -> training_dataset -> ml_model
+
+Input:
+    - Feature rows from feature_extractor.py
+    - Per-query HypoPG labels from data/labels.csv
+
+Output:
+    - data/training/train.csv
+    - data/training/val.csv
+    - data/training/test.csv
+    - data/training/all.csv
+    - data/training/all_debug_with_raw_labels.csv
+
+Important design choices:
+    - Requires exact per-query labels keyed by:
+          query_name | candidate_table | candidate_cols
+    - Does NOT support legacy candidate-level label broadcasting.
+    - Uses only individual HypoPG optimizer-estimated labels.
+    - Removes label_raw and label_source from train/val/test exports to avoid leakage.
+    - Splits by query_name, not by random row, to reduce query-template leakage.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
-import sys
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import random
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
 
-_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
-
-import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
-from candidate_generator import generate_candidates
-from db_utils import get_connection
-from feature_extractor import build_feature_rows
 from workload_parser import parse_workload
+from candidate_generator import generate_candidates
+from feature_extractor import build_feature_rows
+from db_utils import get_connection
 
+
+QUERIES_DIR = "queries"
+DEFAULT_LABELS_PATH = "data/labels.csv"
+DEFAULT_OUTPUT_DIR = "data/training"
+DEFAULT_MIN_COST_IMPACT = 50000.0
+DEFAULT_SEED = 42
+
+# Metadata columns are allowed in the exported CSVs, but should never be model
+# features. ml_model.py should exclude these explicitly when selecting features.
 ID_METADATA_COLUMNS: Tuple[str, ...] = (
     "example_id",
     "query_name",
     "candidate_table",
     "candidate_cols",
     "candidate_type",
-    # label_source is string metadata; the numeric version is is_marginal
+)
+
+# Columns that contain label-generation information and must not enter model
+# features. We keep them only in all_debug_with_raw_labels.csv for auditing.
+LEAKAGE_OR_DEBUG_COLUMNS: Tuple[str, ...] = (
+    "label_raw",
     "label_source",
+    "is_marginal",
 )
 
 
-def example_id(query_name: str, candidate_table: str, candidate_cols: str) -> str:
-    """Stable row id for merging features with hypopg_labeler output."""
-    return f"{query_name}|{candidate_table}|{candidate_cols}"
-
-
-def add_example_ids(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        r = dict(row)
-        r["example_id"] = example_id(
-            str(r["query_name"]),
-            str(r["candidate_table"]),
-            str(r["candidate_cols"]),
-        )
-        out.append(r)
-    return out
-
-
-def build_feature_dataframe(
-    conn,
-    candidates: List[dict],
-    workload: List[dict],
-    queries_dir: str,
-    schema: str = "public",
-) -> pd.DataFrame:
-    rows = build_feature_rows(
-        conn,
-        candidates,
-        workload,
-        queries_dir=queries_dir,
-        schema=schema,
-    )
-    rows = add_example_ids(rows)
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
-
-
-def load_labels_csv(path: str) -> pd.DataFrame:
-    """
-    Load labels from hypopg_labeler CSV.
-
-    Handles two formats:
-
-    Option B (per-query labels — preferred):
-        query_name, candidate_table, candidate_cols, label, label_source
-        q3,  lineitem, l_partkey,l_suppkey, 12000, marginal
-        q12, lineitem, l_partkey,l_suppkey, 1098000000, marginal
-
-        When query_name is present, example_id is constructed from the three
-        columns so merge_features_and_labels can join on it exactly — one label
-        per feature row, no broadcasting.
-
-    Option A (per-candidate labels — legacy compatibility path):
-        candidate_table, candidate_cols, label, label_source
-        lineitem, l_partkey,l_suppkey, 1100426205, marginal
-
-        When query_name is absent, the label is broadcast to all query rows
-        for that candidate in merge_features_and_labels.
-    """
-    df = pd.read_csv(path)
-
-    if "example_id" not in df.columns:
-        if all(c in df.columns for c in ("query_name", "candidate_table", "candidate_cols")):
-            # Option B — construct example_id so the exact join path is used
-            df = df.copy()
-            df["example_id"] = (
-                df["query_name"].astype(str) + "|" +
-                df["candidate_table"].astype(str) + "|" +
-                df["candidate_cols"].astype(str)
-            )
-        else:
-            # Option A — legacy broadcasting path, just needs candidate_table + candidate_cols
-            missing = {
-                c for c in ("candidate_table", "candidate_cols")
-                if c not in df.columns
-            }
-            if missing:
-                raise ValueError(
-                    f"Labels CSV must have 'example_id', or all three of "
-                    f"query_name/candidate_table/candidate_cols (Option B), "
-                    f"or at least candidate_table/candidate_cols (Option A legacy broadcasting). "
-                    f"Missing: {sorted(missing)}"
-                )
-    return df
-
-
-def merge_features_and_labels(
-    features: pd.DataFrame,
-    labels: pd.DataFrame,
-    label_columns: Optional[Sequence[str]] = None,
-) -> pd.DataFrame:
-    """
-    Merge labels onto features.
-
-    Preferred path:
-        If labels has 'example_id', join on that so each (query, candidate)
-        feature row receives exactly its own per-query label.
-
-    Legacy compatibility path:
-        If labels lacks 'example_id', join on (candidate_table, candidate_cols)
-        and broadcast the label to every query row that shares that candidate.
-        This supports older per-candidate label files.
-
-    After merging, label_source ('marginal' | 'individual') is converted to a
-    numeric is_marginal column (1.0 / 0.0) so it is picked up by
-    infer_numeric_feature_columns and included in the exported CSVs as a proper
-    feature. label_source itself is retained as metadata for debugging.
-    """
-    if features.empty:
-        return features.copy()
-
-    label_key_cols = {"example_id", "candidate_table", "candidate_cols", "query_name"}
-
-    if label_columns is None:
-        label_columns = [c for c in labels.columns if c not in label_key_cols]
+def normalize_candidate_cols(value: object) -> str:
+    """Canonicalize candidate_cols while preserving column order."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [str(v).strip() for v in value]
     else:
-        for c in label_columns:
-            if c not in labels.columns:
-                raise ValueError(f"Label column {c!r} not in labels dataframe")
-
-    if "example_id" in labels.columns:
-        merge_df = labels[["example_id"] + list(label_columns)].drop_duplicates(subset=["example_id"])
-        merged = features.merge(merge_df, on="example_id", how="left")
-    else:
-        join_keys = ["candidate_table", "candidate_cols"]
-        merge_df = labels[join_keys + list(label_columns)].drop_duplicates(subset=join_keys)
-        merged = features.merge(merge_df, on=join_keys, how="left")
-
-    # Convert label_source -> is_marginal so exported CSVs are self-contained.
-    if "label_source" in merged.columns:
-        merged["is_marginal"] = (merged["label_source"] == "marginal").astype(float)
-    else:
-        merged["is_marginal"] = 0.0
-
-    return merged
+        parts = [p.strip() for p in str(value).split(",")]
+    return ",".join(p for p in parts if p)
 
 
-def apply_log_transform(df: pd.DataFrame, label_column: str) -> pd.DataFrame:
-    """
-    Signed log1p-transform the label column to compress the large cost scale
-    while preserving the sign of negative benefits.
-
-    Benefit scores span many orders of magnitude — q20 alone has costs in
-    the billions while small-table queries sit in the thousands. Without this,
-    the model learns almost entirely from high-cost outliers and all
-    recommendations end up being lineitem indexes.
-
-    Signed log transform:
-        positive benefit  ->  log1p(x)
-        zero benefit      ->  0.0
-        negative benefit  ->  -log1p(|x|)
-
-    NaN values are preserved as NaN.
-    """
-    def _signed_log1p(x: Any) -> float:
-        if pd.isna(x):
-            return np.nan
-        x = float(x)
-        return np.log1p(x) if x >= 0 else -np.log1p(abs(x))
-
-    df = df.copy()
-    df[label_column] = df[label_column].apply(_signed_log1p)
-    return df
+def make_example_id(query_name: object, table: object, cols: object) -> str:
+    """Build the shared join key used by features and labels."""
+    return f"{str(query_name)}|{str(table)}|{normalize_candidate_cols(cols)}"
 
 
-def infer_numeric_feature_columns(df: pd.DataFrame) -> List[str]:
-    """All numeric columns except ids and label columns."""
-    skip = set(ID_METADATA_COLUMNS)
-    cols: List[str] = []
-    for c in df.columns:
-        if c in skip:
-            continue
-        if c.startswith("label_") or c == "label":
-            continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            cols.append(c)
-    return cols
+def signed_log1p(x: float) -> float:
+    """Signed log transform for cost-delta labels with large dynamic range."""
+    if pd.isna(x):
+        return float("nan")
+    x = float(x)
+    return math.copysign(math.log1p(abs(x)), x)
 
 
-def train_val_test_split_dataframe(
-    df: pd.DataFrame,
-    label_column: str,
-    test_size: float = 0.2,
-    val_size: float = 0.1,
-    random_state: int = 42,
-    stratify: bool = False,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    work = df.dropna(subset=[label_column]).copy()
-    if work.empty:
-        raise ValueError("No rows with non-null labels; cannot split.")
-
-    strat = None
-    if stratify:
-        y = work[label_column]
-        if y.nunique() >= 2 and y.value_counts().min() >= 2:
-            strat = y
-
-    idx = np.arange(len(work))
-    i_trainval, i_test = train_test_split(
-        idx, test_size=test_size, random_state=random_state, stratify=strat
-    )
-    trainval = work.iloc[i_trainval]
-    test = work.iloc[i_test]
-
-    val_ratio = val_size / max(1e-9, (1.0 - test_size))
-    if len(trainval) < 2:
-        train, val = trainval, trainval.iloc[0:0]
-    else:
-        y_tv = trainval[label_column]
-        strat_tv = None
-        if stratify and y_tv.nunique() >= 2 and y_tv.value_counts().min() >= 2:
-            strat_tv = y_tv
-        i_train, i_val = train_test_split(
-            np.arange(len(trainval)),
-            test_size=val_ratio,
-            random_state=random_state,
-            stratify=strat_tv,
-        )
-        train = trainval.iloc[i_train]
-        val = trainval.iloc[i_val]
-
-    return train, val, test
-
-
-def feature_matrix(
-    df: pd.DataFrame,
-    feature_columns: Optional[Sequence[str]] = None,
-    label_column: str = "label",
-) -> Tuple[pd.DataFrame, pd.Series]:
-    if feature_columns is None:
-        feature_columns = infer_numeric_feature_columns(df)
-    X = df.loc[:, list(feature_columns)].astype(np.float64).fillna(0.0)
-    y = df[label_column]
-    return X, y
-
-
-def write_labels_template(features: pd.DataFrame, path: str) -> None:
-    cols = ["example_id", "query_name", "candidate_table", "candidate_cols", "label"]
-    have = [c for c in cols if c in features.columns]
-    tpl = features[have].drop_duplicates(subset=["example_id"]).copy()
-    if "label" not in tpl.columns:
-        tpl["label"] = np.nan
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tpl.to_csv(path, index=False)
-
-
-def export_splits(
-    train: pd.DataFrame,
-    val: pd.DataFrame,
-    test: pd.DataFrame,
-    out_dir: str,
-    fmt: str = "csv",
-) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    if fmt == "csv":
-        train.to_csv(os.path.join(out_dir, "train.csv"), index=False)
-        val.to_csv(os.path.join(out_dir, "val.csv"), index=False)
-        test.to_csv(os.path.join(out_dir, "test.csv"), index=False)
-    elif fmt == "parquet":
-        try:
-            train.to_parquet(os.path.join(out_dir, "train.parquet"), index=False)
-            val.to_parquet(os.path.join(out_dir, "val.parquet"), index=False)
-            test.to_parquet(os.path.join(out_dir, "test.parquet"), index=False)
-        except ImportError as e:
-            raise ImportError("Parquet export requires pyarrow.") from e
-    else:
-        raise ValueError("fmt must be 'csv' or 'parquet'")
-
-
-def build_training_splits(
-    conn,
-    workload: List[dict],
-    candidates: List[dict],
-    queries_dir: str,
-    labels_path: Optional[str] = None,
-    label_column: str = "label",
-    label_columns: Optional[Sequence[str]] = None,
-    placeholder_label: Optional[float] = None,
-    test_size: float = 0.2,
-    val_size: float = 0.1,
-    random_state: int = 42,
-    stratify: bool = False,
-    schema: str = "public",
-    log_transform: bool = True,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    features = build_feature_dataframe(
-        conn, candidates, workload, queries_dir=queries_dir, schema=schema
-    )
-    if features.empty:
-        empty = pd.DataFrame()
-        return empty, empty, empty, empty
-
-    if labels_path:
-        labels = load_labels_csv(labels_path)
-        features = merge_features_and_labels(features, labels, label_columns=label_columns)
-        if label_column not in features.columns:
-            raise ValueError(f"After merge, expected label column {label_column!r} is missing")
-    elif placeholder_label is not None:
-        features = features.copy()
-        features[label_column] = float(placeholder_label)
-
-    if label_column not in features.columns or features[label_column].isna().all():
-        return features, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    if log_transform and label_column in features.columns:
-        features = apply_log_transform(features, label_column)
-
-    train, val, test = train_val_test_split_dataframe(
-        features,
-        label_column=label_column,
-        test_size=test_size,
-        val_size=val_size,
-        random_state=random_state,
-        stratify=stratify,
-    )
-    return features, train, val, test
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build training dataset from feature_extractor + labels CSV."
-    )
-    parser.add_argument("--repo-root", default=os.path.dirname(_SRC_DIR))
-    parser.add_argument("--out-dir", default=None)
-    parser.add_argument("--labels", default=None, help="CSV from hypopg_labeler.")
-    parser.add_argument("--label-template", default=None)
-    parser.add_argument(
-        "--min-cost-impact",
-        type=float,
-        default=50000.0,
-        help="Candidate generator min_cost_impact threshold.",
-    )
-    parser.add_argument("--label-column", default="label")
-    parser.add_argument("--placeholder-label", type=float, default=None)
-    parser.add_argument("--fmt", choices=("csv", "parquet"), default="csv")
-    parser.add_argument("--stratify", action="store_true")
-    parser.add_argument(
-        "--no-log-transform",
-        action="store_true",
-        help="Disable signed log1p label transform.",
-    )
-    args = parser.parse_args()
-
-    repo_root = os.path.abspath(args.repo_root)
-    queries_dir = os.path.join(repo_root, "queries")
-    out_dir = args.out_dir or os.path.join(repo_root, "data", "training")
-
-    workload = parse_workload(queries_dir)
-    candidates = generate_candidates(workload, min_cost_impact=args.min_cost_impact)
+def build_features(min_cost_impact: float = DEFAULT_MIN_COST_IMPACT) -> pd.DataFrame:
+    """Run workload_parser -> candidate_generator -> feature_extractor."""
+    workload = parse_workload(QUERIES_DIR)
+    candidates = generate_candidates(workload, min_cost_impact=min_cost_impact)
 
     conn = get_connection()
     try:
-        if args.label_template:
-            features = build_feature_dataframe(conn, candidates, workload, queries_dir=queries_dir)
-            write_labels_template(features, args.label_template)
-            print(f"Wrote label template ({len(features)} rows) to {args.label_template}")
-            return
-
-        features, train, val, test = build_training_splits(
-            conn,
-            workload,
-            candidates,
-            queries_dir=queries_dir,
-            labels_path=args.labels,
-            label_column=args.label_column,
-            placeholder_label=args.placeholder_label,
-            stratify=args.stratify,
-            log_transform=not args.no_log_transform,
-        )
+        feature_rows = build_feature_rows(conn, candidates, workload)
     finally:
         conn.close()
 
+    features = pd.DataFrame(feature_rows)
     if features.empty:
-        print("No feature rows; check DB, workload, and candidates.")
-        return
+        raise RuntimeError("feature_extractor produced no feature rows")
 
-    if train.empty and args.labels is None and args.placeholder_label is None:
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, "features_unlabeled.csv")
-        features.to_csv(path, index=False)
-        print(f"Wrote {len(features)} unlabeled rows to {path}.")
-        return
+    required = {"query_name", "candidate_table", "candidate_cols"}
+    missing = required - set(features.columns)
+    if missing:
+        raise RuntimeError(f"feature rows missing required columns: {sorted(missing)}")
 
-    if train.empty:
-        print("No labeled rows to split; check labels file and label column.")
-        return
-
-    export_splits(train, val, test, out_dir, fmt=args.fmt)
-    print(
-        f"Wrote train/val/test to {out_dir} ({args.fmt}): "
-        f"{len(train)} / {len(val)} / {len(test)} rows."
+    features["candidate_cols"] = features["candidate_cols"].map(normalize_candidate_cols)
+    features["example_id"] = features.apply(
+        lambda r: make_example_id(r["query_name"], r["candidate_table"], r["candidate_cols"]),
+        axis=1,
     )
+
+    return features
+
+
+def load_labels(labels_path: str | os.PathLike[str]) -> pd.DataFrame:
+    """Load exact per-query HypoPG labels and build example_id."""
+    labels = pd.read_csv(labels_path)
+
+    required = {"query_name", "candidate_table", "candidate_cols", "label"}
+    missing = required - set(labels.columns)
+    if missing:
+        raise RuntimeError(
+            "labels.csv must contain exact per-query labels with columns "
+            f"{sorted(required)}; missing {sorted(missing)}"
+        )
+
+    labels["candidate_cols"] = labels["candidate_cols"].map(normalize_candidate_cols)
+    labels["example_id"] = labels.apply(
+        lambda r: make_example_id(r["query_name"], r["candidate_table"], r["candidate_cols"]),
+        axis=1,
+    )
+
+    labels["label"] = pd.to_numeric(labels["label"], errors="raise")
+
+    if "label_source" in labels.columns:
+        sources = set(labels["label_source"].dropna().astype(str).unique())
+        if sources != {"individual"}:
+            raise RuntimeError(
+                "training_dataset expects only individual HypoPG labels. "
+                f"Found label_source values: {sorted(sources)}"
+            )
+    else:
+        labels["label_source"] = "individual"
+
+    return labels[["example_id", "query_name", "candidate_table", "candidate_cols", "label", "label_source"]]
+
+
+def validate_exact_alignment(features: pd.DataFrame, labels: pd.DataFrame) -> None:
+    """Fail fast if feature rows and label rows do not match exactly."""
+    if features["example_id"].duplicated().any():
+        dupes = features.loc[features["example_id"].duplicated(), "example_id"].head(10).tolist()
+        raise RuntimeError(f"duplicate feature example_id values, examples: {dupes}")
+
+    if labels["example_id"].duplicated().any():
+        dupes = labels.loc[labels["example_id"].duplicated(), "example_id"].head(10).tolist()
+        raise RuntimeError(f"duplicate label example_id values, examples: {dupes}")
+
+    feature_keys = set(features["example_id"])
+    label_keys = set(labels["example_id"])
+
+    missing_labels = sorted(feature_keys - label_keys)
+    extra_labels = sorted(label_keys - feature_keys)
+
+    if missing_labels or extra_labels:
+        msg = [
+            "feature-label alignment failed",
+            f"feature rows: {len(feature_keys)}",
+            f"label rows:   {len(label_keys)}",
+        ]
+        if missing_labels:
+            msg.append(f"missing labels for first examples: {missing_labels[:10]}")
+        if extra_labels:
+            msg.append(f"labels without features for first examples: {extra_labels[:10]}")
+        raise RuntimeError("\n".join(msg))
+
+    forbidden_feature_cols = {"clustered_candidate", "is_marginal"}
+    present = forbidden_feature_cols & set(features.columns)
+    if present:
+        raise RuntimeError(f"feature rows contain stale/leaky columns: {sorted(present)}")
+
+
+def build_training_dataset(
+    labels_path: str | os.PathLike[str] = DEFAULT_LABELS_PATH,
+    min_cost_impact: float = DEFAULT_MIN_COST_IMPACT,
+) -> pd.DataFrame:
+    """Build exact joined dataset and transform labels."""
+    features = build_features(min_cost_impact=min_cost_impact)
+    labels = load_labels(labels_path)
+
+    validate_exact_alignment(features, labels)
+
+    labels_for_join = labels[["example_id", "label", "label_source"]].rename(
+        columns={"label": "label_raw"}
+    )
+    dataset = features.merge(labels_for_join, on="example_id", how="inner", validate="one_to_one")
+
+    if dataset["label_raw"].isna().any():
+        raise RuntimeError("merged dataset contains missing label_raw values")
+
+    dataset["label"] = dataset["label_raw"].map(signed_log1p)
+
+    if dataset["label"].isna().any():
+        raise RuntimeError("label transform produced NaN values")
+
+    return dataset
+
+
+def split_queries(
+    query_names: Sequence[str],
+    seed: int = DEFAULT_SEED,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+) -> Tuple[set, set, set]:
+    """Deterministically split query templates into train/val/test groups."""
+    queries = sorted(set(str(q) for q in query_names))
+    if len(queries) < 3:
+        raise RuntimeError("Need at least 3 distinct query_name values for train/val/test split")
+
+    rng = random.Random(seed)
+    rng.shuffle(queries)
+
+    n = len(queries)
+    n_train = max(1, int(round(n * train_frac)))
+    n_val = max(1, int(round(n * val_frac)))
+
+    # Ensure test split is non-empty.
+    if n_train + n_val >= n:
+        n_train = max(1, n - 2)
+        n_val = 1
+
+    train_q = set(queries[:n_train])
+    val_q = set(queries[n_train:n_train + n_val])
+    test_q = set(queries[n_train + n_val:])
+
+    if not train_q or not val_q or not test_q:
+        raise RuntimeError(
+            f"invalid query split sizes: train={len(train_q)}, val={len(val_q)}, test={len(test_q)}"
+        )
+
+    return train_q, val_q, test_q
+
+
+def remove_leakage_columns_for_training(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop debug/label-generation columns from training exports.
+
+    This prevents the current or future ml_model.py from accidentally using
+    raw labels or label-source metadata as numeric features.
+    """
+    drop_cols = [c for c in LEAKAGE_OR_DEBUG_COLUMNS if c in df.columns]
+    return df.drop(columns=drop_cols)
+
+
+def save_splits(
+    dataset: pd.DataFrame,
+    output_dir: str | os.PathLike[str] = DEFAULT_OUTPUT_DIR,
+    seed: int = DEFAULT_SEED,
+) -> Dict[str, Path]:
+    """Save all/debug/train/val/test CSV files using query-template split."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    train_q, val_q, test_q = split_queries(dataset["query_name"].tolist(), seed=seed)
+
+    train = dataset[dataset["query_name"].astype(str).isin(train_q)].copy()
+    val = dataset[dataset["query_name"].astype(str).isin(val_q)].copy()
+    test = dataset[dataset["query_name"].astype(str).isin(test_q)].copy()
+
+    validate_split_no_query_leakage(train, val, test)
+
+    # Debug file preserves raw labels for human inspection only.
+    debug_path = out / "all_debug_with_raw_labels.csv"
+    dataset.to_csv(debug_path, index=False)
+
+    # Training-facing files drop raw labels and label source metadata.
+    all_clean = remove_leakage_columns_for_training(dataset)
+    train_clean = remove_leakage_columns_for_training(train)
+    val_clean = remove_leakage_columns_for_training(val)
+    test_clean = remove_leakage_columns_for_training(test)
+
+    paths = {
+        "all": out / "all.csv",
+        "train": out / "train.csv",
+        "val": out / "val.csv",
+        "test": out / "test.csv",
+        "debug": debug_path,
+    }
+
+    all_clean.to_csv(paths["all"], index=False)
+    train_clean.to_csv(paths["train"], index=False)
+    val_clean.to_csv(paths["val"], index=False)
+    test_clean.to_csv(paths["test"], index=False)
+
+    return paths
+
+
+def validate_split_no_query_leakage(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame) -> None:
+    """Ensure no query template appears in more than one split."""
+    train_q = set(train["query_name"].astype(str))
+    val_q = set(val["query_name"].astype(str))
+    test_q = set(test["query_name"].astype(str))
+
+    overlaps = {
+        "train_val": train_q & val_q,
+        "train_test": train_q & test_q,
+        "val_test": val_q & test_q,
+    }
+    bad = {k: v for k, v in overlaps.items() if v}
+    if bad:
+        raise RuntimeError(f"query-template leakage across splits: {bad}")
+
+
+def validate_training_exports(paths: Dict[str, Path]) -> None:
+    """Sanity-check exported CSVs for leakage-prone columns."""
+    for split_name in ("all", "train", "val", "test"):
+        df = pd.read_csv(paths[split_name])
+        forbidden = {"label_raw", "is_marginal", "clustered_candidate"} & set(df.columns)
+        if forbidden:
+            raise RuntimeError(f"{paths[split_name]} contains forbidden columns: {sorted(forbidden)}")
+        if "label" not in df.columns:
+            raise RuntimeError(f"{paths[split_name]} missing transformed label column")
+        if df["label"].isna().any():
+            raise RuntimeError(f"{paths[split_name]} contains NaN labels")
+
+    debug = pd.read_csv(paths["debug"])
+    if "label_raw" not in debug.columns:
+        raise RuntimeError("debug dataset should contain label_raw for auditing")
+
+
+def print_summary(dataset: pd.DataFrame, paths: Dict[str, Path]) -> None:
+    """Human-readable run summary."""
+    train = pd.read_csv(paths["train"])
+    val = pd.read_csv(paths["val"])
+    test = pd.read_csv(paths["test"])
+
+    print("\n" + "=" * 60)
+    print("Training dataset built successfully")
+    print(f"Total joined rows:       {len(dataset)}")
+    print(f"Distinct queries:        {dataset['query_name'].nunique()}")
+    print(f"Distinct candidates:     {dataset[['candidate_table', 'candidate_cols']].drop_duplicates().shape[0]}")
+    print(f"Train rows / queries:    {len(train)} / {train['query_name'].nunique()}")
+    print(f"Val rows / queries:      {len(val)} / {val['query_name'].nunique()}")
+    print(f"Test rows / queries:     {len(test)} / {test['query_name'].nunique()}")
+    print("\nWrote:")
+    for name, path in paths.items():
+        print(f"  {name:>5}: {path}")
+    print("\nSanity check passed: feature rows + HypoPG labels are exactly aligned,")
+    print("and train/val/test are split by query_name to reduce template leakage.")
+    print("=" * 60)
+
+    preview_cols = [
+        "example_id",
+        "query_name",
+        "candidate_table",
+        "candidate_cols",
+        "candidate_type",
+        "label",
+    ]
+    debug_cols = [c for c in ["label_raw", "label_source"] if c in dataset.columns]
+    sample_cols = [c for c in preview_cols + debug_cols if c in dataset.columns]
+    print("\nSample rows:")
+    print(dataset[sample_cols].head(10).to_string(index=False))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build ML training dataset from features and HypoPG labels.")
+    parser.add_argument("--labels", default=DEFAULT_LABELS_PATH, help="Path to labels.csv from hypopg_labeler.py")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for train/val/test CSVs")
+    parser.add_argument("--min-cost-impact", type=float, default=DEFAULT_MIN_COST_IMPACT)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    dataset = build_training_dataset(labels_path=args.labels, min_cost_impact=args.min_cost_impact)
+    paths = save_splits(dataset, output_dir=args.output_dir, seed=args.seed)
+    validate_training_exports(paths)
+    print_summary(dataset, paths)
 
 
 if __name__ == "__main__":

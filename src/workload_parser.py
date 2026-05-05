@@ -72,17 +72,46 @@ def get_operator(comparison) -> str:
     return '='
 
 
-def get_predicate_type(operator: str) -> str:
+def get_predicate_type_from_expr(expr: str) -> str:
     """
-    Classify a SQL comparison operator as equality or range.
+    Classify a predicate using the full comparison text.
+
+    Categories:
+      equality      -> =, IN
+      range         -> <, <=, >, >=, BETWEEN
+      prefix_like   -> LIKE 'abc%'
+      pattern_like  -> LIKE '%abc%'
+      negative      -> !=, <>, NOT IN, NOT LIKE, NOT BETWEEN
+      unknown       -> fallback
     """
-    operator = operator.strip().upper()
-    if operator in ['=', '!=', '<>', 'IN', 'NOT IN', 'LIKE', 'NOT LIKE']:
-        return 'equality'
-    elif operator in ['<', '<=', '>', '>=', 'BETWEEN', 'NOT BETWEEN']:
-        return 'range'
-    else:
-        return 'equality'
+    e = " ".join(expr.upper().split())
+
+    if " NOT LIKE " in e or " NOT IN " in e or " NOT BETWEEN " in e:
+        return "negative"
+
+    if "<>" in e or "!=" in e:
+        return "negative"
+
+    if " LIKE " in e:
+        # Leading-wildcard LIKE is not a normal B-tree equality/range predicate.
+        # Example: p_name LIKE '%light%'
+        if "LIKE '%" in e or 'LIKE "%' in e:
+            return "pattern_like"
+        return "prefix_like"
+
+    if " BETWEEN " in e:
+        return "range"
+
+    if any(op in e for op in ["<=", ">=", "<", ">"]):
+        return "range"
+
+    if " IN " in e:
+        return "equality"
+
+    if "=" in e:
+        return "equality"
+
+    return "unknown"
 
 
 def strip_alias(column_name: str) -> str:
@@ -158,7 +187,7 @@ def extract_columns(sql: str) -> list:
     column appears in: WHERE > GROUP BY > ORDER BY.
     """
     raw_results = []
-    parsed = sqlparse.parse(sql)[0]
+    parsed_statements = sqlparse.parse(sql)
     current_clause = 'n/a'
 
     def walk(token_list):
@@ -189,11 +218,12 @@ def extract_columns(sql: str) -> list:
             if current_clause == 'WHERE':
                 if isinstance(token, sqlparse.sql.Comparison):
                     try:
-                        op = get_operator(token)
-                        ptype = get_predicate_type(op)
-                    except:
-                        ptype = 'equality'
+                        ptype = get_predicate_type_from_expr(str(token))
+                    except Exception:
+                        ptype = 'unknown'
+
                     raw_results.extend(extract_columns_from_token(token.left, current_clause, ptype))
+
                     if not isinstance(token.right, sqlparse.sql.Parenthesis) or 'select' not in str(token.right).lower():
                         raw_results.extend(extract_columns_from_token(token.right, current_clause, ptype))
 
@@ -201,14 +231,49 @@ def extract_columns(sql: str) -> list:
                     peek_idx = idx + 1
                     while peek_idx < len(tokens) and tokens[peek_idx].is_whitespace:
                         peek_idx += 1
+
                     if peek_idx < len(tokens):
                         next_tok = tokens[peek_idx]
-                        if next_tok.ttype is sqlparse.tokens.Keyword:
-                            kw = next_tok.value.upper()
-                            if kw == 'IN':
-                                raw_results.extend(extract_columns_from_token(token, current_clause, 'equality'))
-                            elif kw == 'BETWEEN':
-                                raw_results.extend(extract_columns_from_token(token, current_clause, 'range'))
+                        kw = next_tok.value.upper()
+
+                        # Handle two-token operators like NOT IN / NOT LIKE / NOT BETWEEN
+                        if kw == "NOT":
+                            peek2_idx = peek_idx + 1
+                            while peek2_idx < len(tokens) and tokens[peek2_idx].is_whitespace:
+                                peek2_idx += 1
+                            if peek2_idx < len(tokens):
+                                kw2 = tokens[peek2_idx].value.upper()
+                                combined = f"NOT {kw2}"
+                                if combined in {"NOT IN", "NOT LIKE", "NOT BETWEEN"}:
+                                    raw_results.extend(
+                                        extract_columns_from_token(token, current_clause, "negative")
+                                    )
+
+                        elif kw == "IN":
+                            raw_results.extend(
+                                extract_columns_from_token(token, current_clause, "equality")
+                            )
+
+                        elif kw == "BETWEEN":
+                            raw_results.extend(
+                                extract_columns_from_token(token, current_clause, "range")
+                            )
+
+                        elif kw == "LIKE":
+                            # Look ahead for the pattern literal.
+                            pattern_idx = peek_idx + 1
+                            while pattern_idx < len(tokens) and tokens[pattern_idx].is_whitespace:
+                                pattern_idx += 1
+
+                            pattern = str(tokens[pattern_idx]) if pattern_idx < len(tokens) else ""
+                            if pattern.strip().startswith(("'%", '"%')):
+                                ptype = "pattern_like"
+                            else:
+                                ptype = "prefix_like"
+
+                            raw_results.extend(
+                                extract_columns_from_token(token, current_clause, ptype)
+                            )
 
             # 3. Extract from grouping/sorting clauses
             elif current_clause in ('GROUP BY', 'ORDER BY'):
@@ -225,7 +290,9 @@ def extract_columns(sql: str) -> list:
 
             idx += 1
 
-    walk(parsed)
+    for parsed in parsed_statements:
+        current_clause = 'n/a'
+        walk(parsed)
 
     # Merge all occurrences of (table, column) into one row with clause flags.
     # This preserves GROUP BY / ORDER BY signal that was previously discarded,
@@ -291,6 +358,7 @@ def parse_workload(queries_dir: str) -> list:
         for col in columns:
             col['query'] = query_name
             col['query_cost'] = cost
+            col['query_sql'] = sql.strip()
 
         all_results.extend(columns)
 
@@ -308,18 +376,38 @@ if __name__ == '__main__':
         f.write(f"Parsed {total} column references with cost data attached.\n\n")
 
         current_query = ""
+
         for item in workload:
             if item['query'] != current_query:
                 current_query = item['query']
-                f.write(f"\n{'='*60}\n")
+
+                f.write(f"\n{'='*80}\n")
                 f.write(f"QUERY: {current_query} (Estimated Cost: {item['query_cost']})\n")
-                f.write(f"{'='*60}\n")
+                f.write(f"{'='*80}\n\n")
+
+                f.write("ORIGINAL SQL:\n")
+                f.write("-" * 80 + "\n")
+                f.write(item.get("query_sql", "").strip())
+                f.write("\n")
+                f.write("-" * 80 + "\n\n")
+
+                f.write("EXTRACTED COLUMNS:\n")
+
             flags = []
-            if item.get('in_where'):    flags.append('WHERE')
-            if item.get('in_group_by'): flags.append('GROUP BY')
-            if item.get('in_order_by'): flags.append('ORDER BY')
+            if item.get('in_where'):
+                flags.append('WHERE')
+            if item.get('in_group_by'):
+                flags.append('GROUP BY')
+            if item.get('in_order_by'):
+                flags.append('ORDER BY')
+
             clause_str = ' + '.join(flags) if flags else 'n/a'
-            predicate   = item.get('predicate_type', 'n/a')
-            f.write(f"  {clause_str:30} {predicate:10} {item['table']}.{item['column']}\n")
+            predicate = item.get('predicate_type', 'n/a')
+
+            f.write(
+                f"  {clause_str:30} "
+                f"{predicate:10} "
+                f"{item['table']}.{item['column']}\n"
+            )
 
     print("Written to query_analysis.txt")
