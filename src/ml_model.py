@@ -24,8 +24,10 @@ Pipeline:
     -> hypopg_labeler -> training_dataset -> ml_model
 
 Usage:
-    python src/ml_model.py --train --no-grid-search
-    python src/ml_model.py --train
+    python src/ml_model.py --train --no-grid-search   # fast: uses TUNED_XGB_PARAMS
+    python src/ml_model.py --train                    # full grid, then train+val refit
+    python src/ml_model.py --train --reproducible     # same grid ranking across runs (n_jobs=1)
+    python src/ml_model.py --train --seed 42 --reproducible
     python src/ml_model.py --recommend --top-k 10
     python src/ml_model.py --recommend --top-k 10 --budget 5000
 """
@@ -36,6 +38,7 @@ import argparse
 import itertools
 import math
 import os
+import random
 import sys
 import time
 from typing import Iterable, List, Sequence, Tuple
@@ -83,11 +86,20 @@ LEAKAGE_COLUMNS = {
 FORBIDDEN_COLUMNS = {"clustered_candidate"}
 
 PARAM_GRID = {
-    "learning_rate": [0.05, 0.1],
-    "max_depth": [3, 5],
-    "subsample": [0.8, 1.0],
-    "colsample_bytree": [0.8, 1.0],
+    "learning_rate": [0.3, 0.5, 0.1],
+    "max_depth": [2, 5],
+    "subsample": [0.7, 1.0],
+    "colsample_bytree": [0.7, 1.0],
     "n_estimators": [100, 300],
+}
+
+# Best combination from full grid search (val RMSE). Used by train_default / --no-grid-search.
+TUNED_XGB_PARAMS = {
+    "learning_rate": 0.1,
+    "max_depth": 5,
+    "subsample": 0.8,
+    "colsample_bytree": 1.0,
+    "n_estimators": 100,
 }
 
 FIXED_PARAMS = {
@@ -98,6 +110,12 @@ FIXED_PARAMS = {
     "n_jobs": -1,
     "verbosity": 0,
 }
+
+
+def apply_training_seed(seed: int) -> None:
+    """Best-effort reproducibility for NumPy, Python RNG, and XGBoost random_state."""
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def feature_cols_path_for_model(model_path: str) -> str:
@@ -298,23 +316,24 @@ def grid_search_cv(
     return best_params, best_rmse, feature_cols
 
 
-def train_default(train: pd.DataFrame, val: pd.DataFrame, label_col: str) -> Tuple[xgb.XGBRegressor, List[str]]:
+def train_default(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    label_col: str,
+    fixed_params: dict = FIXED_PARAMS,
+) -> Tuple[xgb.XGBRegressor, List[str]]:
     feature_cols = infer_numeric_feature_columns(train, label_col=label_col)
     X_train, y_train = feature_matrix(train, feature_cols, label_col)
     X_val, y_val = feature_matrix(val, feature_cols, label_col)
 
     model = xgb.XGBRegressor(
-        learning_rate=0.05,
-        max_depth=3,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        n_estimators=300,
-        random_state=42,
-        n_jobs=-1,
-        early_stopping_rounds=15,
-        eval_metric="rmse",
-        objective="reg:squarederror",
-        verbosity=0,
+        **TUNED_XGB_PARAMS,
+        objective=fixed_params["objective"],
+        random_state=fixed_params["random_state"],
+        n_jobs=fixed_params["n_jobs"],
+        verbosity=fixed_params["verbosity"],
+        eval_metric=fixed_params["eval_metric"],
+        early_stopping_rounds=fixed_params["early_stopping_rounds"],
     )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     return model, feature_cols
@@ -326,6 +345,7 @@ def train_with_best_params(
     label_col: str,
     best_params: dict,
     feature_cols: Sequence[str],
+    fixed_params: dict = FIXED_PARAMS,
 ) -> xgb.XGBRegressor:
     trainval = pd.concat([train, val], ignore_index=True)
     X_all, y_all = feature_matrix(trainval, feature_cols, label_col)
@@ -335,11 +355,11 @@ def train_with_best_params(
         subsample=best_params["subsample"],
         colsample_bytree=best_params["colsample_bytree"],
         n_estimators=best_params["n_estimators"],
-        random_state=42,
-        n_jobs=-1,
-        eval_metric="rmse",
-        objective="reg:squarederror",
-        verbosity=0,
+        random_state=fixed_params["random_state"],
+        n_jobs=fixed_params["n_jobs"],
+        eval_metric=fixed_params["eval_metric"],
+        objective=fixed_params["objective"],
+        verbosity=fixed_params["verbosity"],
     )
     model.fit(X_all, y_all, verbose=False)
     return model
@@ -507,7 +527,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train or run the index recommendation model.")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--recommend", action="store_true")
-    parser.add_argument("--no-grid-search", action="store_true", help="Use default hyperparameters.")
+    parser.add_argument(
+        "--no-grid-search",
+        action="store_true",
+        help="Skip grid search; train with TUNED_XGB_PARAMS (early stopping on val).",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--budget", type=float, default=None, help="Optional greedy budget using write_penalty_proxy units.")
     parser.add_argument("--training-dir", default=TRAINING_DIR)
@@ -515,23 +539,47 @@ def main() -> None:
     parser.add_argument("--label-column", default="label")
     parser.add_argument("--repo-root", default=_REPO_ROOT)
     parser.add_argument("--min-cost-impact", type=float, default=DEFAULT_MIN_COST_IMPACT)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=FIXED_PARAMS["random_state"],
+        help="RNG seed for NumPy/Python (XGBoost uses random_state from fixed params).",
+    )
+    parser.add_argument(
+        "--reproducible",
+        action="store_true",
+        help="Use n_jobs=1 for training so subsample/colsample runs are thread-deterministic (slower).",
+    )
     args = parser.parse_args()
 
     cols_path = feature_cols_path_for_model(args.model_path)
 
     if args.train:
+        apply_training_seed(args.seed)
+        fixed = dict(FIXED_PARAMS)
+        fixed["random_state"] = args.seed
+        if args.reproducible:
+            fixed["n_jobs"] = 1
+            print(f"Reproducible training: seed={args.seed}, n_jobs=1")
+        else:
+            print(f"Training seed: {args.seed} (use --reproducible if val RMSE varies run-to-run)")
+
         print("Loading train/val/test splits...")
         train, val, test = load_splits(args.training_dir)
         print(f"  train={len(train)} val={len(val)} test={len(test)}")
         feature_cols = check_pipeline_alignment(train, val, test, args.label_column)
 
         if args.no_grid_search:
-            print("\nTraining with default hyperparameters...")
-            model, feature_cols = train_default(train, val, args.label_column)
+            print("\nTraining with TUNED_XGB_PARAMS (--no-grid-search)...")
+            model, feature_cols = train_default(train, val, args.label_column, fixed_params=fixed)
         else:
-            best_params, _, feature_cols = grid_search_cv(train, val, args.label_column)
+            best_params, _, feature_cols = grid_search_cv(
+                train, val, args.label_column, fixed_params=fixed
+            )
             print(f"\nTraining final model on train+val ({len(train) + len(val)} rows)...")
-            model = train_with_best_params(train, val, args.label_column, best_params, feature_cols)
+            model = train_with_best_params(
+                train, val, args.label_column, best_params, feature_cols, fixed_params=fixed
+            )
 
         evaluate(model, test, feature_cols, args.label_column, split_name="test")
         print_feature_importance(model, feature_cols)

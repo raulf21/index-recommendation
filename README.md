@@ -68,18 +68,48 @@ docker exec -i tpch-db psql -U postgres -d tpch -c "SELECT COUNT(*) FROM lineite
 ```
 
 You should see `6001215` rows.
-### 7. Running the the Full pipeline 
-To run the end-to-end index recommendation system, execute the scripts in the src/ directory in the following sequential order. 
-A. Generate labels HypoPG 
-```python src/hypopg_labeler.py```
-B. Build the Training dataset:
-```python src/training_dataset.py --labels data/labels.csv```
-C. Train the Machine learning model
-```python src/ml_model.py --train```
-or 
-```python ml_model.py --train --no-grid-search```
-D. Get recommendation
-```python src/ml_model.py --recommend --top-k 10```
+### 7. Run the full pipeline
+From the repo root, run the scripts below in order:
+
+#### A) Generate HypoPG labels
+```bash
+python3 src/hypopg_labeler.py
+```
+
+#### B) Build train/val/test dataset
+```bash
+python3 src/training_dataset.py --labels data/labels.csv
+```
+
+#### C) Train model
+- Full grid search + final refit on train+val:
+```bash
+python3 src/ml_model.py --train
+```
+- Skip grid search and train with `TUNED_XGB_PARAMS`:
+```bash
+python3 src/ml_model.py --train --no-grid-search
+```
+- Reproducible training (fixed seed + single-thread training):
+```bash
+python3 src/ml_model.py --train --seed 42 --reproducible
+```
+
+#### D) Print top-k recommendations
+```bash
+python3 src/ml_model.py --recommend --top-k 10
+```
+
+#### E) Optional physical evaluation with real indexes
+Create top-k physical indexes, compare planner costs before/after, then drop eval indexes:
+```bash
+python3 src/evaluate_indexes.py --top-k 5 --drop-after
+```
+
+To inspect index impact without creating indexes:
+```bash
+python3 src/evaluate_indexes.py --top-k 5 --dry-run
+```
 
 
 
