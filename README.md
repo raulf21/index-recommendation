@@ -147,4 +147,4 @@ index-recommendation/
 
 .
 
-**[Sindhu Satish]** .
+**[Sindhu Satish]** worked on feature engineering, training-data assembly, and physical index evaluation. Contributions included building the feature extractor over PostgreSQL catalog statistics and `EXPLAIN` plan summaries, implementing the training dataset builder that aligns features with HypoPG labels and produces query-template-split train/val/test sets, adding seeded reproducible training to the XGBoost pipeline, and creating the end-to-end evaluation script that materializes top-k recommended indexes and measures per-query planner-cost reduction against a no-index baseline.
