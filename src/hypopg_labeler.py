@@ -1,28 +1,22 @@
 """
 hypopg_labeler.py
------------------
-Creates supervised labels for candidate indexes using HypoPG.
 
-Important design choice:
-    Labels are optimizer-estimated benefits, not measured runtime benefits.
-    HypoPG indexes are hypothetical/planner-only, so the correct measurement is:
+Generates supervised labels for candidate indexes using HypoPG.
 
-        label = baseline_EXPLAIN_cost - EXPLAIN_cost_with_hypothetical_index
+Labels are based on optimizer-estimated cost improvement:
 
-    Do not replace this with EXPLAIN ANALYZE. EXPLAIN ANALYZE executes the query
-    against real storage, where the hypothetical index does not physically exist.
+    label = baseline_EXPLAIN_cost - EXPLAIN_cost_with_hypothetical_index
 
-Input:
+Because HypoPG indexes are hypothetical and do not physically exist, this module
+uses EXPLAIN instead of EXPLAIN ANALYZE.
+
+Inputs:
     - workload rows from workload_parser.py
-    - candidates from candidate_generator.py
+    - candidate indexes from candidate_generator.py
     - SQL files from queries/
 
-Output CSV format:
+Output:
     query_name,candidate_table,candidate_cols,label,label_source
-
-Pipeline:
-    workload_parser -> candidate_generator -> feature_extractor -> hypopg_labeler
-    -> training_dataset -> ml_model
 """
 
 from __future__ import annotations
@@ -137,10 +131,6 @@ def candidate_cols_string(candidate: dict) -> str:
     return ",".join(candidate["columns"])
 
 
-def label_key(query_name: str, candidate: dict) -> Tuple[str, str, str]:
-    return (str(query_name), str(candidate["table"]), candidate_cols_string(candidate))
-
-
 def relevant_queries_for_candidate(candidate: dict, workload: List[dict]) -> Set[str]:
     """
     Use candidate source_queries when present so label rows align with patched
@@ -246,10 +236,6 @@ def _feature_key(row: dict) -> Tuple[str, str, str]:
     return (str(row["query_name"]), str(row["candidate_table"]), str(row["candidate_cols"]))
 
 
-def _label_row_key(row: dict) -> Tuple[str, str, str]:
-    return (str(row["query_name"]), str(row["candidate_table"]), str(row["candidate_cols"]))
-
-
 def sanity_check_candidate_system(candidates: Sequence[dict]) -> None:
     """Validate patched candidate_generator.py output contract."""
     if not candidates:
@@ -298,7 +284,7 @@ def sanity_check_learning_alignment(
             raise AssertionError("Feature rows missing range_scan_candidate.")
 
     feature_keys = [_feature_key(r) for r in feature_rows]
-    label_keys = [_label_row_key(r) for r in label_rows]
+    label_keys = [_feature_key(r) for r in label_rows]
 
     if len(feature_keys) != len(set(feature_keys)):
         raise AssertionError("Duplicate feature keys found.")

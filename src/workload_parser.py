@@ -1,41 +1,24 @@
 """
 workload_parser.py
-------------------
-Parses TPC-H SQL query files and extracts column references
-used in WHERE, GROUP BY, and ORDER BY clauses.
 
-Input:
-    - Directory of .sql query files (queries/)
+Parses TPC-H SQL query files and extracts column references that may be
+useful for index recommendation.
+
+The parser records whether each column appears in filtering, grouping, or
+ordering contexts, along with predicate type and estimated query cost from
+PostgreSQL EXPLAIN.
+
+Inputs:
+    - SQL files from queries/
+    - PostgreSQL connection for optimizer cost estimates
 
 Output:
-    - List of dicts, each representing a column reference:
-      {
-          "table":         "lineitem",
-          "column":        "l_shipdate",
-          "clause":        "WHERE",          # primary clause (WHERE > GROUP BY > ORDER BY)
-          "predicate_type":"range",           # from WHERE occurrence; 'n/a' if only in sorting clauses
-          "in_where":      True,             # appeared in WHERE / ON / HAVING
-          "in_group_by":   False,            # appeared in GROUP BY
-          "in_order_by":   True,             # appeared in ORDER BY
-          "query":         "q1",
-          "query_cost":    84530.0
-      }
+    - List of dictionaries, one per relevant column reference per query
 
-Changes from original:
-    - Dedup key changed from (table, column, clause) to (table, column) so that
-      query_cost is counted exactly once per column per query in candidate_generator,
-      regardless of how many clauses that column appears in.
-    - Added DB connection to fetch optimizer cost per query via EXPLAIN.
-    - Imports from db_utils to avoid circular dependency with feature_extractor.
-    - Clause membership preserved as in_where / in_group_by / in_order_by boolean
-      flags on each merged row instead of dropping multi-clause columns.
-      Previously a column in both WHERE and GROUP BY would lose its GROUP BY signal
-      entirely. Now both are recorded. This allows feature_extractor to expose
-      sort-elimination opportunities (B+ trees skip Sort nodes for GROUP BY / ORDER BY)
-      as features for the model.
-
-Pipeline position:
-    workload_parser → candidate_generator → feature_extractor → hypopg_labeler → ml_model
+Notes:
+    - Columns are deduplicated by (table, column) per query.
+    - Clause membership is preserved using boolean flags so a column used in
+      multiple clauses keeps all relevant signals.
 """
 
 import os
@@ -60,16 +43,6 @@ PREFIX_TO_TABLE = {
 # WHERE carries the most actionable predicate info, so it wins on ties.
 _CLAUSE_PRIORITY = {'WHERE': 0, 'GROUP BY': 1, 'ORDER BY': 2, 'n/a': 3}
 
-
-def get_operator(comparison) -> str:
-    """
-    Extract the comparison operator from a sqlparse Comparison token.
-    Defaults to '=' if no operator token is found.
-    """
-    for token in comparison.tokens:
-        if token.ttype in (sqlparse.tokens.Comparison, sqlparse.tokens.Token.Comparison):
-            return token.value.strip()
-    return '='
 
 
 def get_predicate_type_from_expr(expr: str) -> str:
@@ -113,15 +86,6 @@ def get_predicate_type_from_expr(expr: str) -> str:
 
     return "unknown"
 
-
-def strip_alias(column_name: str) -> str:
-    """
-    Strip table alias from a column name.
-    e.g. 'l1.l_suppkey' → 'l_suppkey', 'n1.n_name' → 'n_name'
-    """
-    if '.' in column_name:
-        return column_name.split('.')[-1]
-    return column_name
 
 
 def load_queries(queries_dir: str) -> dict:

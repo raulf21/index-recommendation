@@ -17,14 +17,6 @@ Output:
     - data/training/test.csv
     - data/training/all.csv
     - data/training/all_debug_with_raw_labels.csv
-
-Important design choices:
-    - Requires exact per-query labels keyed by:
-          query_name | candidate_table | candidate_cols
-    - Does NOT support legacy candidate-level label broadcasting.
-    - Uses only individual HypoPG optimizer-estimated labels.
-    - Removes label_raw and label_source from train/val/test exports to avoid leakage.
-    - Splits by query_name, not by random row, to reduce query-template leakage.
 """
 
 from __future__ import annotations
@@ -34,7 +26,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 

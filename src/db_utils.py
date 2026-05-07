@@ -5,11 +5,6 @@ Shared database utilities used across the pipeline.
 Centralizes get_connection, normalize_query_for_postgres, and explain_query_json
 so that workload_parser and feature_extractor can both import from here
 without creating a circular dependency.
-
-Previously these were defined in feature_extractor.py and imported via a local
-import hack in workload_parser.py. Moving them here breaks the cycle cleanly
-and eliminates the three duplicate get_connection() definitions that existed
-across workload_parser, feature_extractor, and hypopg_labeler.
 """
 
 import json

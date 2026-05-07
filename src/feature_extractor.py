@@ -17,13 +17,6 @@ Input:
 Output:
     - List of dicts, one row per (query_name, candidate) pair.
       These rows are later joined with HypoPG labels in training_dataset.py.
-
-Important design choices:
-    - This file does not decide which indexes are good. It only describes them.
-    - Candidate selection/pruning belongs in candidate_generator.py.
-    - Ground-truth benefit labels belong in hypopg_labeler.py.
-    - The old clustered_candidate field is intentionally removed because HypoPG
-      simulates normal indexes, not PostgreSQL physical CLUSTER behavior.
 """
 
 from __future__ import annotations

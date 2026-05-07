@@ -141,6 +141,10 @@ index-recommendation/
     └── ml_model.py               ← XGBoost training and recommendation engine
 ```
 
-## Team
-- [Raul Flores](https://github.com/raulf21)
-- [Sindhu Satish ]()
+## Project Contributions
+
+**[Raul Flores]** worked on the backend infrastructure, query-processing pipeline, and machine learning components. Contributions included setting up the database environment, implementing workload parsing and candidate index generation, creating training labels with HypoPG, and building the model used for final index recommendations. 
+
+.
+
+**[Sindhu Satish]** .
